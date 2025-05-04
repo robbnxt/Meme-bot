@@ -1,0 +1,14 @@
+{
+    "discord_token": "YOUR_DISCORD_BOT_TOKEN_HERE",
+    "reddit_client_id": "YOUR_REDDIT_CLIENT_ID_HERE",
+    "reddit_client_secret": "YOUR_REDDIT_CLIENT_SECRET_HERE",
+    "reddit_username": "YOUR_REDDIT_USERNAME_HERE",
+    "reddit_password": "YOUR_REDDIT_PASSWORD_HERE",
+    "meme_subreddits": [
+        "memes",
+        "dankmemes",
+        "wholesomememes",
+        "programmerhumor",
+        "memeeconomy"
+    ]
+}

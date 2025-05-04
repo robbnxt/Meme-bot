@@ -1,0 +1,342 @@
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <random>
+#include <ctime>
+#include <thread>
+#include <mutex>
+#include <dpp/dpp.h>
+#include <nlohmann/json.hpp>
+#include <cpr/cpr.h>
+
+using json = nlohmann::json;
+
+// Configuration structure
+struct Config {
+    std::string token;
+    std::string reddit_client_id;
+    std::string reddit_client_secret;
+    std::string reddit_username;
+    std::string reddit_password;
+    std::vector<std::string> meme_subreddits;
+};
+
+// Meme structure
+struct Meme {
+    std::string title;
+    std::string url;
+    std::string subreddit;
+    int score;
+};
+
+class MemeBot {
+private:
+    dpp::cluster bot;
+    Config config;
+    std::string reddit_access_token;
+    std::time_t token_expiry;
+    std::vector<Meme> meme_cache;
+    std::mutex cache_mutex;
+    
+    // Load configuration from config.json
+    bool load_config() {
+        try {
+            std::ifstream config_file("config.json");
+            if (!config_file.is_open()) {
+                std::cerr << "Failed to open config.json" << std::endl;
+                return false;
+            }
+            
+            json config_json;
+            config_file >> config_json;
+            
+            config.token = config_json["discord_token"];
+            config.reddit_client_id = config_json["reddit_client_id"];
+            config.reddit_client_secret = config_json["reddit_client_secret"];
+            config.reddit_username = config_json["reddit_username"];
+            config.reddit_password = config_json["reddit_password"];
+            
+            for (const auto& subreddit : config_json["meme_subreddits"]) {
+                config.meme_subreddits.push_back(subreddit);
+            }
+            
+            return true;
+        } catch (const std::exception& e) {
+            std::cerr << "Error loading config: " << e.what() << std::endl;
+            return false;
+        }
+    }
+    
+    // Get Reddit OAuth token
+    bool get_reddit_token() {
+        try {
+            std::string auth_header = "Basic " + dpp::utility::base64_encode(
+                config.reddit_client_id + ":" + config.reddit_client_secret
+            );
+            
+            cpr::Response r = cpr::Post(
+                cpr::Url{"https://www.reddit.com/api/v1/access_token"},
+                cpr::Header{{"Authorization", auth_header}, {"User-Agent", "DiscordMemeBot/1.0"}},
+                cpr::Payload{
+                    {"grant_type", "password"},
+                    {"username", config.reddit_username},
+                    {"password", config.reddit_password}
+                }
+            );
+            
+            if (r.status_code == 200) {
+                json response = json::parse(r.text);
+                reddit_access_token = response["access_token"];
+                token_expiry = std::time(nullptr) + response["expires_in"].get<int>();
+                return true;
+            } else {
+                std::cerr << "Failed to get Reddit token: " << r.text << std::endl;
+                return false;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Error getting Reddit token: " << e.what() << std::endl;
+            return false;
+        }
+    }
+    
+    // Check if Reddit token is valid, refresh if needed
+    bool ensure_valid_token() {
+        if (reddit_access_token.empty() || std::time(nullptr) >= token_expiry) {
+            return get_reddit_token();
+        }
+        return true;
+    }
+    
+    // Get memes from a subreddit
+    std::vector<Meme> get_memes_from_subreddit(const std::string& subreddit) {
+        std::vector<Meme> memes;
+        
+        if (!ensure_valid_token()) {
+            return memes;
+        }
+        
+        try {
+            cpr::Response r = cpr::Get(
+                cpr::Url{"https://oauth.reddit.com/r/" + subreddit + "/hot"},
+                cpr::Header{
+                    {"Authorization", "Bearer " + reddit_access_token},
+                    {"User-Agent", "DiscordMemeBot/1.0"}
+                },
+                cpr::Parameters{{"limit", "30"}}
+            );
+            
+            if (r.status_code == 200) {
+                json response = json::parse(r.text);
+                
+                for (const auto& post : response["data"]["children"]) {
+                    // Filter for image posts only
+                    std::string url = post["data"]["url"];
+                    std::string post_hint = post["data"].contains("post_hint") ? 
+                                           post["data"]["post_hint"].get<std::string>() : "";
+                    
+                    if ((post_hint == "image" || 
+                         url.find(".jpg") != std::string::npos || 
+                         url.find(".png") != std::string::npos || 
+                         url.find(".gif") != std::string::npos) && 
+                        !post["data"]["over_18"].get<bool>()) {  // Filter out NSFW content
+                        
+                        Meme meme;
+                        meme.title = post["data"]["title"];
+                        meme.url = url;
+                        meme.subreddit = subreddit;
+                        meme.score = post["data"]["score"];
+                        
+                        memes.push_back(meme);
+                    }
+                }
+            } else {
+                std::cerr << "Failed to get memes from " << subreddit << ": " << r.text << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Error getting memes from " << subreddit << ": " << e.what() << std::endl;
+        }
+        
+        return memes;
+    }
+    
+    // Refresh meme cache
+    void refresh_meme_cache() {
+        std::vector<Meme> new_memes;
+        
+        for (const auto& subreddit : config.meme_subreddits) {
+            auto subreddit_memes = get_memes_from_subreddit(subreddit);
+            new_memes.insert(new_memes.end(), subreddit_memes.begin(), subreddit_memes.end());
+        }
+        
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        meme_cache = new_memes;
+        std::cout << "Meme cache refreshed. Total memes: " << meme_cache.size() << std::endl;
+    }
+    
+    // Cache refresh thread function
+    void cache_refresh_thread_func() {
+        while (true) {
+            refresh_meme_cache();
+            std::this_thread::sleep_for(std::chrono::minutes(10)); // Refresh every 10 minutes
+        }
+    }
+    
+    // Get a random meme from cache
+    Meme get_random_meme() {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        
+        if (meme_cache.empty()) {
+            Meme empty_meme;
+            empty_meme.title = "No memes available";
+            empty_meme.url = "";
+            return empty_meme;
+        }
+        
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> distrib(0, meme_cache.size() - 1);
+        
+        return meme_cache[distrib(gen)];
+    }
+    
+    // Get a meme from a specific subreddit
+    Meme get_meme_from_subreddit(const std::string& subreddit) {
+        std::lock_guard<std::mutex> lock(cache_mutex);
+        
+        std::vector<Meme> subreddit_memes;
+        for (const auto& meme : meme_cache) {
+            if (meme.subreddit == subreddit) {
+                subreddit_memes.push_back(meme);
+            }
+        }
+        
+        if (subreddit_memes.empty()) {
+            Meme empty_meme;
+            empty_meme.title = "No memes available from r/" + subreddit;
+            empty_meme.url = "";
+            return empty_meme;
+        }
+        
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> distrib(0, subreddit_memes.size() - 1);
+        
+        return subreddit_memes[distrib(gen)];
+    }
+    
+    // Register bot commands
+    void register_commands() {
+        bot.on_ready([this](const dpp::ready_t& event) {
+            std::cout << "Bot logged in as " << bot.me.username << std::endl;
+            
+            // Create global commands
+            dpp::slashcommand meme_command("meme", "Get a random meme", bot.me.id);
+            
+            // Add an optional parameter for subreddit
+            meme_command.add_option(
+                dpp::command_option(dpp::co_string, "subreddit", "Specific subreddit to get meme from (optional)")
+                    .set_required(false)
+            );
+            
+            // Create global application command
+            bot.global_command_create(meme_command);
+            
+            // Start cache refresh thread
+            refresh_meme_cache();
+            std::thread cache_thread(&MemeBot::cache_refresh_thread_func, this);
+            cache_thread.detach();
+        });
+        
+        // Handle slash commands
+        bot.on_slashcommand([this](const dpp::slashcommand_t& event) {
+            if (event.command.get_command_name() == "meme") {
+                // Get subreddit parameter if provided
+                std::string subreddit = "";
+                if (event.get_parameter("subreddit").index() != 0) {
+                    subreddit = std::get<std::string>(event.get_parameter("subreddit"));
+                }
+                
+                // Acknowledge the command
+                event.thinking(true);
+                
+                Meme meme;
+                if (!subreddit.empty()) {
+                    // Check if the subreddit is in our allowed list
+                    bool allowed = false;
+                    for (const auto& allowed_sub : config.meme_subreddits) {
+                        if (allowed_sub == subreddit) {
+                            allowed = true;
+                            break;
+                        }
+                    }
+                    
+                    if (allowed) {
+                        meme = get_meme_from_subreddit(subreddit);
+                    } else {
+                        event.edit_response(
+                            dpp::message("Sorry, that subreddit is not in my allowed list. Try one of these: " + 
+                                         [this]() {
+                                             std::string list;
+                                             for (size_t i = 0; i < config.meme_subreddits.size(); ++i) {
+                                                 list += "r/" + config.meme_subreddits[i];
+                                                 if (i < config.meme_subreddits.size() - 1) {
+                                                     list += ", ";
+                                                 }
+                                             }
+                                             return list;
+                                         }())
+                        );
+                        return;
+                    }
+                } else {
+                    meme = get_random_meme();
+                }
+                
+                if (meme.url.empty()) {
+                    event.edit_response(dpp::message(meme.title));
+                    return;
+                }
+                
+                // Create embed with the meme
+                dpp::embed embed;
+                embed.set_title(meme.title);
+                embed.set_color(0xFFA500);  // Orange color
+                embed.set_image(meme.url);
+                embed.set_footer(dpp::embed_footer()
+                    .set_text("From r/" + meme.subreddit + " | 👍 " + std::to_string(meme.score))
+                );
+                
+                // Send the response
+                event.edit_response(dpp::message().add_embed(embed));
+            }
+        });
+    }
+    
+public:
+    MemeBot() {
+        if (!load_config()) {
+            throw std::runtime_error("Failed to load configuration");
+        }
+        
+        bot = dpp::cluster(config.token);
+        bot.intents = dpp::i_default_intents | dpp::i_message_content;
+    }
+    
+    void run() {
+        register_commands();
+        bot.start(dpp::st_wait);
+    }
+};
+
+int main() {
+    try {
+        MemeBot bot;
+        bot.run();
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}
