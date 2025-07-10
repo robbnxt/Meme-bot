@@ -122,7 +122,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [Reddit API](https://www.reddit.com/dev/api/) for meme content
 
 ---
-
-<p align="center">
-  Made with ❤️ by <a href="https://github.com/robbnxt">robbnxt</a>
-</p>
